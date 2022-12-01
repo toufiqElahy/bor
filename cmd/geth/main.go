@@ -19,9 +19,7 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"os"
-	godebug "runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,7 +39,11 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/node"
-	gopsutil "github.com/shirou/gopsutil/mem"
+
+	// Force-load the tracer engines to trigger registration
+	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
+	_ "github.com/ethereum/go-ethereum/eth/tracers/native"
+
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -58,6 +60,7 @@ var (
 	app = flags.NewApp(gitCommit, gitDate, fmt.Sprintf("the %s command line interface", repositoryIdentifier))
 	// flags that configure the node
 	nodeFlags = []cli.Flag{
+		utils.BorLogsFlag,
 		utils.IdentityFlag,
 		utils.UnlockedAccountFlag,
 		utils.PasswordFileFlag,
@@ -70,7 +73,8 @@ var (
 		utils.NoUSBFlag,
 		utils.USBFlag,
 		utils.SmartCardDaemonPathFlag,
-		utils.OverrideBerlinFlag,
+		utils.OverrideArrowGlacierFlag,
+		utils.OverrideTerminalTotalDifficulty,
 		utils.EthashCacheDirFlag,
 		utils.EthashCachesInMemoryFlag,
 		utils.EthashCachesOnDiskFlag,
@@ -105,7 +109,8 @@ var (
 		utils.UltraLightFractionFlag,
 		utils.UltraLightOnlyAnnounceFlag,
 		utils.LightNoSyncServeFlag,
-		utils.WhitelistFlag,
+		utils.EthPeerRequiredBlocksFlag,
+		utils.LegacyWhitelistFlag,
 		utils.BloomFilterSizeFlag,
 		utils.CacheFlag,
 		utils.CacheDatabaseFlag,
@@ -116,19 +121,20 @@ var (
 		utils.CacheSnapshotFlag,
 		utils.CacheNoPrefetchFlag,
 		utils.CachePreimagesFlag,
+		utils.FDLimitFlag,
 		utils.ListenPortFlag,
 		utils.MaxPeersFlag,
 		utils.MaxPendingPeersFlag,
 		utils.MiningEnabledFlag,
 		utils.MinerThreadsFlag,
 		utils.MinerNotifyFlag,
-		utils.MinerGasTargetFlag,
+		utils.LegacyMinerGasTargetFlag,
 		utils.MinerGasLimitFlag,
 		utils.MinerGasPriceFlag,
 		utils.MinerEtherbaseFlag,
 		utils.MinerExtraDataFlag,
 		utils.MinerRecommitIntervalFlag,
-		utils.MinerNoVerfiyFlag,
+		utils.MinerNoVerifyFlag,
 		utils.NATFlag,
 		utils.NoDiscoverFlag,
 		utils.DiscoveryV5Flag,
@@ -139,10 +145,14 @@ var (
 		utils.MainnetFlag,
 		utils.DeveloperFlag,
 		utils.DeveloperPeriodFlag,
+		utils.DeveloperGasLimitFlag,
 		utils.RopstenFlag,
+		utils.SepoliaFlag,
 		utils.RinkebyFlag,
 		utils.GoerliFlag,
-		utils.YoloV3Flag,
+		utils.MumbaiFlag,
+		utils.BorMainnetFlag,
+		utils.KilnFlag,
 		utils.VMEnableDebugFlag,
 		utils.NetworkIdFlag,
 		utils.EthStatsURLFlag,
@@ -151,8 +161,8 @@ var (
 		utils.GpoBlocksFlag,
 		utils.GpoPercentileFlag,
 		utils.GpoMaxGasPriceFlag,
-		utils.EWASMInterpreterFlag,
-		utils.EVMInterpreterFlag,
+		utils.GpoIgnoreGasPriceFlag,
+		utils.MinerNotifyFullFlag,
 		configFileFlag,
 	}
 
@@ -161,13 +171,11 @@ var (
 		utils.HTTPListenAddrFlag,
 		utils.HTTPPortFlag,
 		utils.HTTPCORSDomainFlag,
+		utils.AuthListenFlag,
+		utils.AuthPortFlag,
+		utils.AuthVirtualHostsFlag,
+		utils.JWTSecretFlag,
 		utils.HTTPVirtualHostsFlag,
-		utils.LegacyRPCEnabledFlag,
-		utils.LegacyRPCListenAddrFlag,
-		utils.LegacyRPCPortFlag,
-		utils.LegacyRPCCORSDomainFlag,
-		utils.LegacyRPCVirtualHostsFlag,
-		utils.LegacyRPCApiFlag,
 		utils.GraphQLEnabledFlag,
 		utils.GraphQLCORSDomainFlag,
 		utils.GraphQLVirtualHostsFlag,
@@ -183,6 +191,7 @@ var (
 		utils.IPCPathFlag,
 		utils.InsecureUnlockAllowedFlag,
 		utils.RPCGlobalGasCapFlag,
+		utils.RPCGlobalEVMTimeoutFlag,
 		utils.RPCGlobalTxFeeCapFlag,
 		utils.AllowUnprotectedTxs,
 	}
@@ -198,6 +207,10 @@ var (
 		utils.MetricsInfluxDBUsernameFlag,
 		utils.MetricsInfluxDBPasswordFlag,
 		utils.MetricsInfluxDBTagsFlag,
+		utils.MetricsEnableInfluxDBV2Flag,
+		utils.MetricsInfluxDBTokenFlag,
+		utils.MetricsInfluxDBBucketFlag,
+		utils.MetricsInfluxDBOrganizationFlag,
 	}
 )
 
@@ -205,7 +218,7 @@ func init() {
 	// Initialize the CLI app and start Geth
 	app.Action = geth
 	app.HideVersion = true // we have a command to print the version
-	app.Copyright = "Copyright 2013-2021 The go-ethereum Authors"
+	app.Copyright = "Copyright 2013-2022 The go-ethereum Authors"
 	app.Commands = []cli.Command{
 		// See chaincmd.go:
 		initCommand,
@@ -213,7 +226,6 @@ func init() {
 		exportCommand,
 		importPreimagesCommand,
 		exportPreimagesCommand,
-		copydbCommand,
 		removedbCommand,
 		dumpCommand,
 		dumpGenesisCommand,
@@ -275,14 +287,20 @@ func prepare(ctx *cli.Context) {
 	case ctx.GlobalIsSet(utils.RopstenFlag.Name):
 		log.Info("Starting Geth on Ropsten testnet...")
 
+	case ctx.GlobalIsSet(utils.SepoliaFlag.Name):
+		log.Info("Starting Geth on Sepolia testnet...")
+
 	case ctx.GlobalIsSet(utils.RinkebyFlag.Name):
 		log.Info("Starting Geth on Rinkeby testnet...")
 
 	case ctx.GlobalIsSet(utils.GoerliFlag.Name):
 		log.Info("Starting Geth on Görli testnet...")
 
-	case ctx.GlobalIsSet(utils.YoloV3Flag.Name):
-		log.Info("Starting Geth on YOLOv3 testnet...")
+	case ctx.GlobalIsSet(utils.MumbaiFlag.Name):
+		log.Info("Starting Bor on Mumbai testnet...")
+
+	case ctx.GlobalIsSet(utils.BorMainnetFlag.Name):
+		log.Info("Starting Bor on Bor mainnet...")
 
 	case ctx.GlobalIsSet(utils.DeveloperFlag.Name):
 		log.Info("Starting Geth in ephemeral dev mode...")
@@ -293,7 +311,12 @@ func prepare(ctx *cli.Context) {
 	// If we're a full node on mainnet without --cache specified, bump default cache allowance
 	if ctx.GlobalString(utils.SyncModeFlag.Name) != "light" && !ctx.GlobalIsSet(utils.CacheFlag.Name) && !ctx.GlobalIsSet(utils.NetworkIdFlag.Name) {
 		// Make sure we're not on any supported preconfigured testnet either
-		if !ctx.GlobalIsSet(utils.RopstenFlag.Name) && !ctx.GlobalIsSet(utils.RinkebyFlag.Name) && !ctx.GlobalIsSet(utils.GoerliFlag.Name) && !ctx.GlobalIsSet(utils.DeveloperFlag.Name) {
+		if !ctx.GlobalIsSet(utils.RopstenFlag.Name) &&
+			!ctx.GlobalIsSet(utils.SepoliaFlag.Name) &&
+			!ctx.GlobalIsSet(utils.RinkebyFlag.Name) &&
+			!ctx.GlobalIsSet(utils.GoerliFlag.Name) &&
+			!ctx.GlobalIsSet(utils.DeveloperFlag.Name) &&
+			!ctx.GlobalIsSet(utils.MumbaiFlag.Name) {
 			// Nope, we're really on mainnet. Bump that cache up!
 			log.Info("Bumping default cache on mainnet", "provided", ctx.GlobalInt(utils.CacheFlag.Name), "updated", 4096)
 			ctx.GlobalSet(utils.CacheFlag.Name, strconv.Itoa(4096))
@@ -304,25 +327,6 @@ func prepare(ctx *cli.Context) {
 		log.Info("Dropping default light client cache", "provided", ctx.GlobalInt(utils.CacheFlag.Name), "updated", 128)
 		ctx.GlobalSet(utils.CacheFlag.Name, strconv.Itoa(128))
 	}
-	// Cap the cache allowance and tune the garbage collector
-	mem, err := gopsutil.VirtualMemory()
-	if err == nil {
-		if 32<<(^uintptr(0)>>63) == 32 && mem.Total > 2*1024*1024*1024 {
-			log.Warn("Lowering memory allowance on 32bit arch", "available", mem.Total/1024/1024, "addressable", 2*1024)
-			mem.Total = 2 * 1024 * 1024 * 1024
-		}
-		allowance := int(mem.Total / 1024 / 1024 / 3)
-		if cache := ctx.GlobalInt(utils.CacheFlag.Name); cache > allowance {
-			log.Warn("Sanitizing cache to Go's GC limits", "provided", cache, "updated", allowance)
-			ctx.GlobalSet(utils.CacheFlag.Name, strconv.Itoa(allowance))
-		}
-	}
-	// Ensure Go's GC ignores the database cache for trigger percentage
-	cache := ctx.GlobalInt(utils.CacheFlag.Name)
-	gogc := math.Max(20, math.Min(100, 100/(float64(cache)/1024)))
-
-	log.Debug("Sanitizing Go's GC trigger", "percent", int(gogc))
-	godebug.SetGCPercent(int(gogc))
 
 	// Start metrics export if enabled
 	utils.SetupMetrics(ctx)
@@ -343,7 +347,7 @@ func geth(ctx *cli.Context) error {
 	stack, backend := makeFullNode(ctx)
 	defer stack.Close()
 
-	startNode(ctx, stack, backend)
+	startNode(ctx, stack, backend, false)
 	stack.Wait()
 	return nil
 }
@@ -351,11 +355,11 @@ func geth(ctx *cli.Context) error {
 // startNode boots up the system node and all registered protocols, after which
 // it unlocks any requested accounts, and starts the RPC/IPC interfaces and the
 // miner.
-func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
+func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isConsole bool) {
 	debug.Memsize.Add("node", stack)
 
 	// Start up the node itself
-	utils.StartNode(ctx, stack)
+	utils.StartNode(ctx, stack, isConsole)
 
 	// Unlock any account specifically requested
 	unlockAccounts(ctx, stack)
@@ -436,7 +440,7 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
 		}
 		ethBackend, ok := backend.(*eth.EthAPIBackend)
 		if !ok {
-			utils.Fatalf("Ethereum service not running: %v", err)
+			utils.Fatalf("Ethereum service not running")
 		}
 		// Set the gas price to the limits from the CLI and start mining
 		gasprice := utils.GlobalBig(ctx, utils.MinerGasPriceFlag.Name)
